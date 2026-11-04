@@ -8,7 +8,7 @@ reports each card's own target/slowdown/shutdown points, and hwmon exports
 tempN_crit / tempN_max where the kernel driver supports it. Published vendor
 specs are only used as a fallback (see REFERENCE and `sysmon --limits`).
 
-Keys:  q quit   +/- refresh rate   r reset peaks   g graphs   c cores
+Keys:  q quit   +/- refresh rate   r reset peaks   g graphs   c cores   d disk
 """
 
 from __future__ import annotations
@@ -480,6 +480,60 @@ def read_meminfo():
     return total - avail, total, swap_used, swap_total
 
 
+# --- disk usage -------------------------------------------------------------
+# Fullness has no vendor spec; these are the usual "getting tight / nearly out
+# of space" marks and only drive colour, never a thermal warning.
+DISK_WARN, DISK_CRIT = 80.0, 92.0
+
+# Pseudo / virtual filesystems whose capacity means nothing on a dashboard.
+SKIP_FSTYPES = frozenset((
+    "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2",
+    "pstore", "securityfs", "debugfs", "tracefs", "configfs", "fusectl",
+    "mqueue", "hugetlbfs", "bpf", "autofs", "efivarfs", "ramfs", "squashfs",
+    "overlay", "binfmt_misc", "rpc_pipefs", "nsfs", "fuse.gvfsd-fuse",
+    "fuse.portal",
+))
+
+_OCTAL_RE = re.compile(r"\\([0-7]{3})")
+
+
+def read_disks():
+    """Mounted real filesystems and their usage.
+
+    Returns [(mount, used_bytes, total_bytes, percent), ...], one entry per
+    backing device (so a device mounted twice is only counted once), sorted by
+    mount point. Pseudo filesystems and anything not backed by /dev are skipped.
+    """
+    seen, out = set(), []
+    try:
+        with open("/proc/mounts") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        dev, mount, fstype = parts[0], parts[1], parts[2]
+        if fstype in SKIP_FSTYPES or not dev.startswith("/dev/"):
+            continue
+        if dev in seen:
+            continue
+        seen.add(dev)
+        # /proc/mounts escapes space/tab/newline in the path as octal \NNN.
+        mount = _OCTAL_RE.sub(lambda m: chr(int(m.group(1), 8)), mount)
+        try:
+            usage = shutil.disk_usage(mount)
+        except OSError:
+            continue
+        if usage.total <= 0:
+            continue
+        pct = 100.0 * usage.used / usage.total
+        out.append((mount, float(usage.used), float(usage.total), pct))
+    out.sort(key=lambda d: d[0])
+    return out
+
+
 def read_loadavg():
     try:
         with open("/proc/loadavg") as fh:
@@ -845,6 +899,12 @@ def build_rows(theme, state, inner_w, inner_h):
         for name, val, lim in state["others"][:8]:
             optional.append(sensor_row(theme, name, val, lim, inner_w))
 
+    if state["show_disk"] and state["disks"]:
+        optional.append(None)
+        optional.append(rule(theme, "disks", inner_w))
+        for mount, used, total, pct in state["disks"][:8]:
+            optional.append(disk_row(theme, mount, used, total, pct, inner_w))
+
     if state["cores"] and state["cpu_pct"]:
         keys = sorted((k for k in state["cpu_pct"] if k != "cpu"),
                       key=lambda k: int(k[3:]) if k[3:].isdigit() else 0)
@@ -909,6 +969,17 @@ def sensor_row(theme, name, val, limits, inner_w):
     segs += heat_bar(theme, limits.frac(val) if limits else val / 100.0,
                      max(6, min(24, inner_w - 40)), "heat")
     segs.append(("  %.0f%sC" % (val, DEG), theme.level(lvl, True)))
+    return segs
+
+
+def disk_row(theme, mount, used, total, pct, inner_w):
+    """One filesystem as a usage bar, coloured by how full it is."""
+    name = mount if len(mount) <= 18 else "…" + mount[-17:]
+    bar = max(6, min(24, inner_w - 44))
+    segs = [("  %-18s" % name, theme.dim)]
+    segs += heat_bar(theme, max(0.0, min(1.0, pct / 100.0)), bar, "load")
+    segs.append(("  %5.1f/%-5.0fG" % (gib(used), gib(total)), theme.value))
+    segs.append(("  %3.0f%%" % pct, theme.load(pct, True)))
     return segs
 
 
@@ -983,9 +1054,9 @@ def draw(stdscr, theme, state):
             for text, attr in rows[i]:
                 x = put(stdscr, y, x, text, attr, w - 1)
 
-    keys = " q quit  ± rate  r reset  g graphs  c cores "
+    keys = " q quit  ± rate  r reset  g graphs  c cores  d disk "
     if len(keys) + 4 > w:
-        keys = " q +- r g c "
+        keys = " q +- r g c d "
     fill = w - 2 - len(keys)
     left = max(0, fill // 2)
     bottom = "└" + "─" * left + keys + "─" * max(0, fill - left) + "┘"
@@ -1010,6 +1081,7 @@ def collect(state, sampler, prev_cpu):
     state["dies"] = cpu_die_temps(chips)
     state["others"] = other_temps(chips)
     state["mem"] = read_meminfo()
+    state["disks"] = read_disks()
     state["load"] = read_loadavg()
     state["uptime"] = read_uptime()
     state["phase"] += 1
@@ -1041,11 +1113,11 @@ def new_state(interval):
         "gpus": [], "gpu_err": None, "cpu_pct": {}, "cpu_temp": None,
         "cpu_sensor": None, "cpu_limits": Limits(**_ref(cpu_profile(model))),
         "cpu_profile": cpu_profile(model), "dies": [], "others": [],
-        "mem": (None, None, None, None), "load": None, "peaks": {},
+        "mem": (None, None, None, None), "disks": [], "load": None, "peaks": {},
         "hist": collections.defaultdict(lambda: collections.deque(maxlen=HISTORY)),
         "interval": interval, "cpu_model": model, "ncpu": os.cpu_count() or 1,
         "host": host, "kernel": kernel, "uptime": read_uptime(),
-        "graphs": True, "cores": False, "phase": 0,
+        "graphs": True, "cores": False, "show_disk": True, "phase": 0,
     }
 
 
@@ -1097,6 +1169,9 @@ def run_tui(stdscr, interval):
             elif ch in (ord("c"), ord("C")):
                 state["cores"] = not state["cores"]
                 next_draw = 0.0
+            elif ch in (ord("d"), ord("D")):
+                state["show_disk"] = not state["show_disk"]
+                next_draw = 0.0
     finally:
         sampler.stop()
 
@@ -1144,6 +1219,12 @@ def run_once():
         print("    %-24s %.0fC  [%s]" % (name, val, LVL_NAME[lim.level(val)]))
     if mem_total:
         print("  MEM    %.1f/%.1f GiB" % (gib(mem_used), gib(mem_total)))
+    disks = read_disks()
+    if disks:
+        print("  DISK")
+        for mount, used, total, pct in disks:
+            print("    %-20s %.1f/%.1f GiB  %3.0f%% used"
+                  % (mount[:20], gib(used), gib(total), pct))
     return 0
 
 
