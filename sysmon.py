@@ -9,6 +9,11 @@ tempN_crit / tempN_max where the kernel driver supports it. Published vendor
 specs are only used as a fallback (see REFERENCE and `sysmon --limits`).
 
 Keys:  q quit   +/- refresh rate   r reset peaks   g graphs   c cores   d disk
+       b bitcoin core watch
+
+If bitcoin-cli is on PATH, a Bitcoin Core panel shows whether the node is up,
+its sync progress, block height and peer count (polled via bitcoin-cli, read
+from the user's own bitcoin.conf -- nothing leaves the machine).
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import argparse
 import collections
 import curses
 import glob
+import json
 import locale
 import os
 import re
@@ -29,6 +35,7 @@ from dataclasses import dataclass, field
 
 MIN_INTERVAL, MAX_INTERVAL = 0.25, 5.0
 HISTORY = 512
+BTC_POLL_SECS = 5.0          # bitcoin-cli is polled at most this often
 
 # --- glyphs -----------------------------------------------------------------
 BLOCK_FULL, BLOCK_EMPTY = "█", "─"
@@ -554,6 +561,70 @@ def read_uptime():
     return ("%dd %dh" % (d, h)) if d else ("%dh %dm" % (h, rem // 60))
 
 
+def _bitcoind_running():
+    """True if a process named exactly 'bitcoind' exists. Never raises."""
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open("/proc/%s/comm" % pid) as fh:
+                    if fh.read().strip() == "bitcoind":
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def query_bitcoin(timeout=2.5):
+    """Local Bitcoin Core status via bitcoin-cli. Reads the user's own conf;
+    nothing leaves the box. Never raises -- returns a {'state': ...} dict where
+    state is one of absent / down / starting / up."""
+    cli = shutil.which("bitcoin-cli")
+    if not cli:
+        return {"state": "absent"}
+
+    def call(*args):
+        try:
+            p = subprocess.run(
+                [cli, "-rpcclienttimeout=%d" % int(timeout), *args],
+                capture_output=True, text=True, timeout=timeout + 1.0)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return None, str(exc)
+        if p.returncode != 0:
+            return None, (p.stderr or "").strip()
+        out = p.stdout.strip()
+        try:
+            return json.loads(out), None
+        except ValueError:
+            return out, None
+
+    info, err = call("getblockchaininfo")
+    if err is not None:
+        low = err.lower()
+        warming = any(s in low for s in
+                      ("-28", "warm", "loading", "verif", "rewind", "init"))
+        if warming or _bitcoind_running():
+            return {"state": "starting",
+                    "detail": "warming up" if warming else "no RPC yet"}
+        return {"state": "down"}
+
+    res = {"state": "up"}
+    if isinstance(info, dict):
+        res["blocks"] = info.get("blocks")
+        res["headers"] = info.get("headers")
+        res["progress"] = info.get("verificationprogress")
+        res["chain"] = info.get("chain")
+        res["ibd"] = info.get("initialblockdownload")
+        res["size"] = info.get("size_on_disk")
+    cc, _ = call("getconnectioncount")
+    if isinstance(cc, int):
+        res["peers"] = cc
+    return res
+
+
 def cpu_model():
     try:
         with open("/proc/cpuinfo") as fh:
@@ -770,6 +841,70 @@ def right_align(segs, inner_w, tail, tail_attr):
 
 # --- layout -----------------------------------------------------------------
 
+def _progress_bar(theme, frac, width, good):
+    """Flat two-tone bar: green when complete, amber while catching up.
+    Unlike heat_bar this is not a hazard gradient -- a full bar is good."""
+    width = max(1, width)
+    frac = 0.0 if frac is None else max(0.0, min(1.0, frac))
+    filled = int(round(frac * width))
+    attr = theme.ramp(0.28, True) if good else theme.ramp(0.72, True)
+    cells = [(BLOCK_FULL, attr) if i < filled else (BLOCK_EMPTY, theme.track)
+             for i in range(width)]
+    return _merge(cells)
+
+
+def btc_rows(theme, state, inner_w, wide):
+    """Bitcoin Core watch panel: an UP/DOWN/SYNCING chip plus, when the node
+    answers, sync progress and a one-line block/peers summary."""
+    b = state.get("btc") or {"state": "..."}
+    st = b.get("state")
+    chips = {
+        "up": ("UP", theme.ramp(0.28, True)),
+        "starting": ("SYNCING", theme.ramp(0.72, True)),
+        "down": ("DOWN", theme.crit),
+        "absent": ("N/A", theme.dim),
+    }
+    name, attr = chips.get(st, ("…", theme.dim))
+    if st == "up" and b.get("ibd"):                 # synced binary, still IBD
+        name, attr = "SYNCING", theme.ramp(0.72, True)
+
+    head = [("BTC".ljust(5), theme.title), ("Bitcoin Core", theme.label)]
+    head = right_align(head, inner_w, "[ %s ]" % name, attr)
+    rows = [head]
+
+    if st == "up":
+        prog = b.get("progress")
+        if prog is not None:
+            good = (not b.get("ibd")) and prog >= 0.99990
+            fixed = 2 + LABEL_W + 2 + VALUE_W
+            bar_w = max(6, inner_w - fixed)
+            segs = [("  " + "SYNC".ljust(LABEL_W), theme.label)]
+            segs += _progress_bar(theme, prog, bar_w, good)
+            segs.append(("  " + ("%.2f%%" % (prog * 100.0)).ljust(VALUE_W),
+                         theme.value))
+            rows.append(segs)
+        bits = []
+        blk, hdr = b.get("blocks"), b.get("headers")
+        if blk is not None:
+            bits.append("block %s" % blk)
+        if hdr is not None and blk is not None and hdr != blk:
+            bits.append("of %s" % hdr)
+        if b.get("peers") is not None:
+            bits.append("%d peers" % b["peers"])
+        if b.get("chain"):
+            bits.append(str(b["chain"]))
+        if wide and b.get("size"):
+            bits.append("%.0fG on disk" % (b["size"] / 1e9))
+        if bits:
+            rows.append([("  " + "  ·  ".join(bits), theme.dim)])
+    elif st == "starting":
+        rows.append([("  " + "node starting (%s)" % b.get("detail", "warming up"),
+                      theme.dim)])
+    elif st == "down":
+        rows.append([("  " + "bitcoind not running", theme.dim)])
+    return rows
+
+
 def build_rows(theme, state, inner_w, inner_h):
     """Core rows first, then optional detail while vertical space remains."""
     gpus, gpu_err = state["gpus"], state["gpu_err"]
@@ -875,15 +1010,24 @@ def build_rows(theme, state, inner_w, inner_h):
 
     mem_used, mem_total, swap_used, swap_total = state["mem"]
     if mem_used is not None:
-        pct = 100.0 * mem_used / mem_total
+        rpct = 100.0 * mem_used / mem_total
         rows.append(meter(theme, "RAM", mem_used / mem_total,
                           "%.1f/%.1fG" % (gib(mem_used), gib(mem_total)),
-                          inner_w, "load", note="%.0f%%" % pct if wide else None,
-                          value_attr=theme.load(pct, True)))
-        if swap_total and swap_used > 0:
-            optional.append(meter(theme, "SWAP", swap_used / swap_total,
-                                  "%.1f/%.1fG" % (gib(swap_used), gib(swap_total)),
-                                  inner_w, "load"))
+                          inner_w, "load", note="%.0f%%" % rpct if wide else None,
+                          value_attr=theme.load(rpct, True)))
+        # SWAP on its own line, directly under RAM.
+        if swap_total:
+            spct = 100.0 * swap_used / swap_total
+            rows.append(meter(theme, "SWAP", swap_used / swap_total,
+                              "%.1f/%.1fG" % (gib(swap_used), gib(swap_total)),
+                              inner_w, "load",
+                              note="%.0f%%" % spct if wide else None,
+                              value_attr=theme.load(spct, True)))
+
+    # --- Bitcoin Core watch (core row: always visible, not truncated) ---
+    if state.get("btc_avail") and state.get("show_btc"):
+        rows.append(None)
+        rows += btc_rows(theme, state, inner_w, wide)
 
     # --- optional detail, shown while vertical space remains ---
     dies = state["dies"]
@@ -1054,9 +1198,9 @@ def draw(stdscr, theme, state):
             for text, attr in rows[i]:
                 x = put(stdscr, y, x, text, attr, w - 1)
 
-    keys = " q quit  ± rate  r reset  g graphs  c cores  d disk "
+    keys = " q quit  ± rate  r reset  g graphs  c cores  d disk  b btc "
     if len(keys) + 4 > w:
-        keys = " q +- r g c d "
+        keys = " q +- r g c d b "
     fill = w - 2 - len(keys)
     left = max(0, fill // 2)
     bottom = "└" + "─" * left + keys + "─" * max(0, fill - left) + "┘"
@@ -1085,6 +1229,12 @@ def collect(state, sampler, prev_cpu):
     state["load"] = read_loadavg()
     state["uptime"] = read_uptime()
     state["phase"] += 1
+
+    if state.get("btc_avail") and state.get("show_btc"):
+        now = time.monotonic()
+        if now >= state.get("btc_poll", 0.0):
+            state["btc"] = query_bitcoin()
+            state["btc_poll"] = now + BTC_POLL_SECS
 
     hist, peaks = state["hist"], state["peaks"]
     if cpu_temp is not None:
@@ -1118,6 +1268,8 @@ def new_state(interval):
         "interval": interval, "cpu_model": model, "ncpu": os.cpu_count() or 1,
         "host": host, "kernel": kernel, "uptime": read_uptime(),
         "graphs": True, "cores": False, "show_disk": True, "phase": 0,
+        "btc": None, "btc_poll": 0.0, "show_btc": True,
+        "btc_avail": shutil.which("bitcoin-cli") is not None,
     }
 
 
@@ -1172,6 +1324,10 @@ def run_tui(stdscr, interval):
             elif ch in (ord("d"), ord("D")):
                 state["show_disk"] = not state["show_disk"]
                 next_draw = 0.0
+            elif ch in (ord("b"), ord("B")):
+                state["show_btc"] = not state["show_btc"]
+                state["btc_poll"] = 0.0        # refresh immediately when shown
+                next_draw = 0.0
     finally:
         sampler.stop()
 
@@ -1225,6 +1381,20 @@ def run_once():
         for mount, used, total, pct in disks:
             print("    %-20s %.1f/%.1f GiB  %3.0f%% used"
                   % (mount[:20], gib(used), gib(total), pct))
+    if shutil.which("bitcoin-cli"):
+        b = query_bitcoin()
+        st = b.get("state")
+        if st == "up":
+            extra = []
+            if b.get("blocks") is not None:
+                extra.append("block %s" % b["blocks"])
+            if b.get("peers") is not None:
+                extra.append("%d peers" % b["peers"])
+            if b.get("progress") is not None:
+                extra.append("%.2f%% synced" % (b["progress"] * 100.0))
+            print("  BTC    UP  (%s)" % "  ".join(extra) if extra else "  BTC    UP")
+        else:
+            print("  BTC    %s" % st.upper())
     return 0
 
 

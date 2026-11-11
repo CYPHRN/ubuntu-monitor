@@ -37,7 +37,35 @@ q      quit
 r      reset peak temperatures
 g      toggle history sparklines
 c      toggle the per-core grid
+d      toggle the disk panel
+b      toggle the Bitcoin Core panel
 ```
+
+## Bitcoin Core watch
+
+If `bitcoin-cli` is on `PATH`, sysmon adds a **BTC** panel that shows at a glance
+whether a local Bitcoin Core node is up:
+
+```
+BTC   Bitcoin Core                                              [ UP ]
+  SYNC  ████████████████████████████████████████████  100.00%
+  block 975450  ·  10 peers  ·  main  ·  891G on disk
+```
+
+* The chip reads `UP`, `SYNCING` (node answering but still in initial block
+  download), `DOWN` (`bitcoind` not running), or `N/A` (binary not installed).
+* Status is polled with `bitcoin-cli -getinfo`-style RPC calls
+  (`getblockchaininfo` + `getconnectioncount`), throttled to once every ~5s and
+  cached between refreshes so it never slows the dashboard.
+* It reads **your own** `bitcoin.conf` for RPC credentials. Nothing leaves the
+  machine; sysmon still makes no network calls.
+* Press **`b`** to hide or show the panel. It only appears when `bitcoin-cli`
+  exists, so boxes without Bitcoin Core are unaffected.
+
+`sysmon --once` also prints a `BTC` line, so node up/down is greppable in logs.
+
+To run the node itself as a boot service, see
+[docs/bitcoin-service.md](docs/bitcoin-service.md).
 
 ## Where the limits come from
 

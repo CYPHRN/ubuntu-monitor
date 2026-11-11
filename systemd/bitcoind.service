@@ -1,0 +1,72 @@
+[Unit]
+# Headless Bitcoin Core daemon. This is the promotion-to-system-service that the
+# old ~/.config/systemd/user/bitcoin-qt.service comments anticipated: the oomd
+# and IO/OOM-score settings below only become effective under system.slice.
+Description=Bitcoin Core daemon (headless) - oomd-exempt, memory/IO/CPU throttled
+Documentation=https://github.com/bitcoin/bitcoin/blob/master/doc/init.md
+Documentation=man:systemd.resource-control(5)
+After=network-online.target
+Wants=network-online.target
+# datadir is on /mnt/storage (rotational LUKS volume, shared with /home). Never
+# start before it is mounted or bitcoind would create a fresh datadir on root.
+RequiresMountsFor=/mnt/storage/bitcoin
+
+[Service]
+# Type=simple, NOT notify: this bitcoind is not linked against libsystemd and
+# sends no sd_notify readiness, so Type=notify would hang until timeout. Run in
+# the foreground (no -daemon); systemd tracks the main PID directly.
+Type=simple
+User=cypher
+Group=cypher
+
+ExecStart=/usr/local/bin/bitcoind -conf=/home/cypher/.bitcoin/bitcoin.conf -pid=/run/bitcoind/bitcoind.pid
+# Clean shutdown so chainstate and wallet flush to disk intact.
+ExecStop=/usr/local/bin/bitcoin-cli -conf=/home/cypher/.bitcoin/bitcoin.conf stop
+# systemd creates /run/bitcoind owned by the service user for the pid file.
+RuntimeDirectory=bitcoind
+
+# --- lifecycle ---
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+# UTXO flush on an HDD with dbcache=1000 can take minutes; the 90s default would
+# SIGKILL mid-flush and discard sync progress.
+TimeoutStopSec=600
+
+# --- never be a systemd-oomd victim ---
+# Ubuntu ships ManagedOOMMemoryPressure=kill at 50% session pressure on user@
+# .service. systemd-oomd SIGKILLed the old GUI unit twice during IBD despite
+# ~406M RSS. 'omit' makes oomd skip this cgroup entirely when choosing a victim.
+ManagedOOMPreference=omit
+ManagedOOMMemoryPressure=auto
+ManagedOOMSwap=auto
+# Now effective (a system unit has CAP_SYS_RESOURCE, a --user unit did not):
+# deprioritise for the in-kernel OOM killer too.
+OOMScoreAdjust=-500
+OOMPolicy=continue
+
+# --- throttle instead of kill ---
+# cgroup v2 charges page cache to the cgroup, so MemoryHigh (a soft reclaim
+# brake, never a kill) also bounds the block-file cache churn that was the real
+# source of desktop stalling. With dbcache=1000 the process sits well under 4G.
+MemoryHigh=4G
+# Hard backstop, 50% above the throttle point; should never be approached.
+MemoryMax=6G
+# Keep it off the small zram swap device.
+MemorySwapMax=1G
+
+# --- yield disk and CPU to the rest of the box ---
+# Under system.slice the io controller is available (it was NOT delegated to
+# user.slice, so this had no effect in the old GUI unit). sdb is mq-deadline so
+# IO weighting is weak, but it costs nothing.
+IOWeight=20
+CPUWeight=50
+Nice=5
+
+# --- hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
